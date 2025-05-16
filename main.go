@@ -22,6 +22,7 @@ const (
 	GameTickDelay = 150 * time.Millisecond
 )
 
+// --- Estruturas de Dados do Jogo ---
 type Point struct {
 	X int `json:"x"`
 	Y int `json:"y"`
@@ -31,9 +32,9 @@ type Player struct {
 	ID       string          `json:"id"`
 	Pos      Point           `json:"pos"`
 	Score    int             `json:"score"`
-	conn     *websocket.Conn `json:"-"`
-	sendChan chan []byte     `json:"-"`
-	IsActive bool            `json:"isActive"`
+	conn     *websocket.Conn `json:"-"` // Não serializar para estado completo/delta
+	sendChan chan []byte     `json:"-"` // Não serializar
+	IsActive bool            // Usado internamente, mas o cliente deduz pela presença/ausência
 }
 
 type Item struct {
@@ -41,84 +42,153 @@ type Item struct {
 	Pos Point  `json:"pos"`
 }
 
-type GameState struct {
-	Players     map[string]*Player `json:"players"`
+// --- Estruturas de Mensagem Servidor -> Cliente ---
+const (
+	MsgTypeWelcome     = "welcome"
+	MsgTypeFullState   = "full_state"
+	MsgTypeDeltaUpdate = "delta_update"
+)
+
+type ServerMessage struct {
+	Type    string      `json:"type"`
+	Payload interface{} `json:"payload"`
+}
+
+type WelcomePayload struct {
+	PlayerID string `json:"playerId"`
+}
+
+// GameStateForClient é uma representação do GameState para enviar aos clientes (sem campos internos)
+type GameStateForClient struct {
+	Players     map[string]*Player `json:"players"` // Enviará apenas os campos serializáveis de Player
 	Items       map[string]*Item   `json:"items"`
 	BoardWidth  int                `json:"boardWidth"`
 	BoardHeight int                `json:"boardHeight"`
 	GameOver    bool               `json:"gameOver"`
 	WinnerID    string             `json:"winnerId,omitempty"`
-	mu          sync.Mutex         // Mutex para proteger o acesso concorrente ao estado
 }
 
+type PlayerDelta struct {
+	ID    string `json:"id"`
+	Pos   *Point `json:"pos,omitempty"`
+	Score *int   `json:"score,omitempty"`
+	// IsNew bool `json:"isNew,omitempty"` // Opcional: para o cliente distinguir
+}
+
+type GameStatusDelta struct {
+	GameOver bool   `json:"gameOver"`
+	WinnerID string `json:"winnerId,omitempty"`
+}
+
+type DeltaPayload struct {
+	PlayersUpdated map[string]PlayerDelta `json:"playersUpdated,omitempty"`
+	PlayersRemoved []string               `json:"playersRemoved,omitempty"`
+	ItemsAdded     []Item                 `json:"itemsAdded,omitempty"`   // Lista de novos itens
+	ItemsRemoved   []string               `json:"itemsRemoved,omitempty"` // Chaves "x,y" dos itens
+	GameStatus     *GameStatusDelta       `json:"gameStatus,omitempty"`
+}
+
+// GameState agora com pendingDeltas
+type GameState struct {
+	Players     map[string]*Player
+	Items       map[string]*Item
+	BoardWidth  int
+	BoardHeight int
+	GameOver    bool
+	WinnerID    string
+
+	pendingDeltas DeltaPayload // Acumulador de mudanças
+	mu            sync.Mutex
+}
+
+// ClientMessage permanece o mesmo
 type ClientMessage struct {
 	Action    string `json:"action"`
 	Direction string `json:"direction"`
 }
 
-var game = &GameState{
-	Players:     make(map[string]*Player),
-	Items:       make(map[string]*Item),
+var game = &GameState{ // Inicialização sem os campos que precisam de make
 	BoardWidth:  BoardWidth,
 	BoardHeight: BoardHeight,
-	GameOver:    false,
+}
+
+func (gs *GameState) resetPendingDeltas() {
+	gs.pendingDeltas = DeltaPayload{
+		PlayersUpdated: make(map[string]PlayerDelta),
+		PlayersRemoved: []string{}, // Iniciar slices vazios
+		ItemsAdded:     []Item{},
+		ItemsRemoved:   []string{},
+		GameStatus:     nil, // Nenhuma mudança de status por padrão
+	}
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// initializeItems coloca os itens no tabuleiro em posições aleatórias
 func (gs *GameState) initializeItems() {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 
-	gs.Items = make(map[string]*Item)
+	gs.resetPendingDeltas() // Começa um novo conjunto de deltas
+
+	currentItems := make(map[string]*Item) // Mapa temporário para novos itens
+	newItemsListForDelta := []Item{}
+
 	for i := 0; i < NumItems; i++ {
 		var itemPos Point
 		uniquePos := false
-		for !uniquePos { // Garante que o item não sobreponha outro item ou jogador inicial
+		for !uniquePos {
 			itemPos = Point{X: rand.Intn(BoardWidth), Y: rand.Intn(BoardHeight)}
 			key := fmt.Sprintf("%d,%d", itemPos.X, itemPos.Y)
-			if _, exists := gs.Items[key]; !exists {
-				playerOccupies := false
-				for _, p := range gs.Players { // Verifica se algum jogador já está lá
-					if p.Pos.X == itemPos.X && p.Pos.Y == itemPos.Y {
-						playerOccupies = true
-						break
-					}
+			_, currentExists := currentItems[key] // Verifica no mapa de novos itens desta rodada
+			playerOccupies := false
+			for _, p := range gs.Players { // Ainda verifica contra jogadores existentes
+				if p.Pos.X == itemPos.X && p.Pos.Y == itemPos.Y {
+					playerOccupies = true
+					break
 				}
-				if !playerOccupies {
-					uniquePos = true
-				}
+			}
+			if !currentExists && !playerOccupies {
+				uniquePos = true
 			}
 		}
 		itemID := "item_" + strconv.Itoa(i)
 		itemKey := fmt.Sprintf("%d,%d", itemPos.X, itemPos.Y)
-		gs.Items[itemKey] = &Item{ID: itemID, Pos: itemPos}
+		newItem := Item{ID: itemID, Pos: itemPos}
+		currentItems[itemKey] = &newItem
+		newItemsListForDelta = append(newItemsListForDelta, newItem)
 	}
+	gs.Items = currentItems // Atribui o novo conjunto de itens
+	gs.pendingDeltas.ItemsAdded = newItemsListForDelta
 
 	gs.GameOver = false
 	gs.WinnerID = ""
+	gs.pendingDeltas.GameStatus = &GameStatusDelta{GameOver: false, WinnerID: ""}
 
-	for _, player := range gs.Players {
+	for playerID, player := range gs.Players {
 		if player.IsActive {
 			player.Score = 0
+			delta, ok := gs.pendingDeltas.PlayersUpdated[playerID]
+			if !ok {
+				delta = PlayerDelta{ID: playerID}
+			}
+			score := 0
+			delta.Score = &score
+			gs.pendingDeltas.PlayersUpdated[playerID] = delta
 		}
 	}
-
-	log.Printf("Jogo iniciado/resetado com %d itens. Pontuações dos jogadores zeradas.", len(gs.Items))
+	log.Printf("Jogo resetado. %d itens. Pontuações zeradas. Deltas preparados.", len(gs.Items))
 }
 
 func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-
 	var startPos Point
 	uniquePos := false
-	for !uniquePos { // Encontra uma posição inicial única
+	// Trava para achar posição inicial e adicionar jogador de forma segura
+	gs.mu.Lock()
+	defer gs.mu.Unlock() // Será liberado após a adição do jogador e atualização do delta
+
+	for !uniquePos {
 		startPos = Point{X: rand.Intn(BoardWidth), Y: rand.Intn(BoardHeight)}
 		occupied := false
 		for _, p := range gs.Players {
@@ -131,7 +201,7 @@ func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
 			continue
 		}
 		itemKey := fmt.Sprintf("%d,%d", startPos.X, startPos.Y)
-		if _, exists := gs.Items[itemKey]; exists { // Não nascer em cima de um item
+		if _, exists := gs.Items[itemKey]; exists {
 			occupied = true
 		}
 		if !occupied {
@@ -144,11 +214,21 @@ func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
 		Pos:      startPos,
 		Score:    0,
 		conn:     conn,
-		sendChan: make(chan []byte, 256), // Canal bufferizado para mensagens de saída
+		sendChan: make(chan []byte, 256),
 		IsActive: true,
 	}
 	gs.Players[id] = player
-	log.Printf("Jogador %s entrou em (%d, %d). Total de jogadores: %d", id, player.Pos.X, player.Pos.Y, len(gs.Players))
+
+	// Adiciona este novo jogador ao delta para notificar OUTROS clientes
+	// (o novo jogador receberá o estado completo)
+	score := 0 // Score inicial é 0
+	pos := player.Pos
+	gs.pendingDeltas.PlayersUpdated[id] = PlayerDelta{
+		ID:    id,
+		Pos:   &pos,   // Envia a posição inicial
+		Score: &score, // Envia o score inicial
+	}
+	log.Printf("Jogador %s (%s) entrou. Delta de entrada preparado.", player.ID, id)
 	return player
 }
 
@@ -157,10 +237,11 @@ func (gs *GameState) removePlayer(id string) {
 	defer gs.mu.Unlock()
 
 	if player, ok := gs.Players[id]; ok {
-		player.IsActive = false // Marca como inativo
-		close(player.sendChan)  // Fecha o canal de envio, sinalizando para a goroutine 'writer' parar
-		delete(gs.Players, id)  // Remove do mapa principal
-		log.Printf("Jogador %s removido. Total de jogadores: %d", id, len(gs.Players))
+		player.IsActive = false
+		close(player.sendChan)
+		delete(gs.Players, id)
+		gs.pendingDeltas.PlayersRemoved = append(gs.pendingDeltas.PlayersRemoved, id)
+		log.Printf("Jogador %s removido. Delta de remoção preparado.", id)
 	}
 }
 
@@ -171,12 +252,12 @@ func (gs *GameState) handlePlayerMove(playerID string, direction string) {
 	if gs.GameOver {
 		return
 	}
-
 	player, ok := gs.Players[playerID]
 	if !ok || !player.IsActive {
 		return
 	}
 
+	oldPos := player.Pos
 	newPos := player.Pos
 	switch direction {
 	case "up":
@@ -196,19 +277,38 @@ func (gs *GameState) handlePlayerMove(playerID string, direction string) {
 			newPos.X++
 		}
 	default:
-		return // Direção inválida
+		return
 	}
 
-	player.Pos = newPos // Atualiza a posição do jogador
+	playerMoved := (oldPos != newPos)
+	if playerMoved {
+		player.Pos = newPos
+		delta, ok := gs.pendingDeltas.PlayersUpdated[playerID]
+		if !ok {
+			delta = PlayerDelta{ID: playerID}
+		}
+		posCopy := newPos // Copia para ponteiro estável
+		delta.Pos = &posCopy
+		gs.pendingDeltas.PlayersUpdated[playerID] = delta
+	}
 
-	// Verifica coleta de item
 	itemKey := fmt.Sprintf("%d,%d", newPos.X, newPos.Y)
-	if item, exists := gs.Items[itemKey]; exists {
+	if _, exists := gs.Items[itemKey]; exists {
 		player.Score++
-		delete(gs.Items, itemKey) // Remove o item do jogo
-		log.Printf("Jogador %s coletou item %s. Pontuação: %d. Itens restantes: %d", player.ID, item.ID, player.Score, len(gs.Items))
+		delete(gs.Items, itemKey)
 
-		if len(gs.Items) == 0 { // Verifica se o jogo acabou
+		delta, ok := gs.pendingDeltas.PlayersUpdated[playerID]
+		if !ok {
+			delta = PlayerDelta{ID: playerID}
+		}
+		scoreCopy := player.Score
+		delta.Score = &scoreCopy
+		gs.pendingDeltas.PlayersUpdated[playerID] = delta
+
+		gs.pendingDeltas.ItemsRemoved = append(gs.pendingDeltas.ItemsRemoved, itemKey)
+		log.Printf("Jogador %s coletou item. Deltas preparados.", player.ID)
+
+		if len(gs.Items) == 0 {
 			gs.GameOver = true
 			winnerScore := -1
 			var winners []string
@@ -223,175 +323,155 @@ func (gs *GameState) handlePlayerMove(playerID string, direction string) {
 				}
 			}
 			if len(winners) > 0 {
-				gs.WinnerID = fmt.Sprintf("%v", winners) // Pode haver empates
-				log.Printf("FIM DE JOGO! Vencedor(es): %s com %d pontos.", gs.WinnerID, winnerScore)
-			} else {
-				log.Printf("FIM DE JOGO! Nenhum jogador ativo para declarar vencedor.")
+				gs.WinnerID = fmt.Sprintf("%v", winners)
 			}
+
+			// Garante que GameStatus seja inicializado se for nil
+			if gs.pendingDeltas.GameStatus == nil {
+				gs.pendingDeltas.GameStatus = &GameStatusDelta{}
+			}
+			gs.pendingDeltas.GameStatus.GameOver = true
+			gs.pendingDeltas.GameStatus.WinnerID = gs.WinnerID
 		}
 	}
 }
 
-// broadcastGameState envia o estado atual do jogo para todos os jogadores ativos
-func (gs *GameState) broadcastGameState() {
-	gs.mu.Lock() // Protege leitura do estado para criar o snapshot
-
-	playersToSend := make(map[string]interface{})
-	for id, p := range gs.Players {
-		if p.IsActive {
-			playersToSend[id] = struct {
-				ID    string `json:"id"`
-				Pos   Point  `json:"pos"`
-				Score int    `json:"score"`
-			}{p.ID, p.Pos, p.Score}
-		}
-	}
-
-	itemsToSend := make(map[string]*Item)
-	for id, i := range gs.Items {
-		itemsToSend[id] = i
-	}
-
-	stateSnapshot := struct {
-		Players     map[string]interface{} `json:"players"`
-		Items       map[string]*Item       `json:"items"`
-		BoardWidth  int                    `json:"boardWidth"`
-		BoardHeight int                    `json:"boardHeight"`
-		GameOver    bool                   `json:"gameOver"`
-		WinnerID    string                 `json:"winnerId,omitempty"`
-	}{
-		Players:     playersToSend,
-		Items:       itemsToSend,
-		BoardWidth:  gs.BoardWidth,
-		BoardHeight: gs.BoardHeight,
-		GameOver:    gs.GameOver,
-		WinnerID:    gs.WinnerID,
-	}
-	gs.mu.Unlock() // Libera o mutex assim que a cópia é feita
-
-	message, err := json.Marshal(stateSnapshot)
-	if err != nil {
-		log.Printf("Erro ao serializar estado do jogo: %v", err)
-		return
-	}
-
-	// Coleta jogadores ativos para enviar a mensagem (para evitar segurar o lock durante os envios)
-	activePlayersToSendTo := []*Player{}
-	gs.mu.Lock()
-	for _, player := range gs.Players {
-		if player.IsActive {
-			activePlayersToSendTo = append(activePlayersToSendTo, player)
-		}
-	}
-	gs.mu.Unlock()
-
-	for _, player := range activePlayersToSendTo {
-		select {
-		case player.sendChan <- message:
-		default:
-			log.Printf("Canal de envio do jogador %s cheio. Descartando mensagem de estado.", player.ID)
-		}
-	}
-}
-
-// writer é uma goroutine que envia mensagens do `sendChan` para o WebSocket do jogador
-func writer(player *Player) {
-	defer func() {
-		player.conn.Close() // Fecha a conexão ao sair
-		log.Printf("Escritor para o jogador %s encerrado.", player.ID)
-	}()
-
-	for message := range player.sendChan { // Loop até o canal ser fechado
-		if err := player.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			log.Printf("Erro ao escrever para jogador %s: %v", player.ID, err)
-			return // Encerra se houver erro de escrita (conexão provavelmente perdida)
-		}
-	}
-}
-
-// reader é uma goroutine que lê mensagens do WebSocket do jogador
-func reader(player *Player) {
-	defer func() {
-		log.Printf("Leitor para o jogador %s encerrando. Realizando limpeza.", player.ID)
-		game.removePlayer(player.ID) // Remove o jogador do jogo (isso fechará sendChan, parando o writer)
-	}()
-
-	player.conn.SetReadLimit(512) // Define um limite de tamanho para mensagens lidas
-	for {
-		messageType, p, err := player.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("Erro de conexão inesperado para jogador %s: %v", player.ID, err)
-			} else {
-				log.Printf("Jogador %s desconectado: %v", player.ID, err)
-			}
-			break // Sai do loop em caso de erro (dispara o defer)
-		}
-
-		if messageType == websocket.TextMessage {
-			var msg ClientMessage
-			if err := json.Unmarshal(p, &msg); err != nil {
-				log.Printf("Erro ao deserializar mensagem de %s: %v", player.ID, err)
-				continue
-			}
-
-			if msg.Action == "move" {
-				game.handlePlayerMove(player.ID, msg.Direction)
-			} else if msg.Action == "reset_game_request" && game.GameOver {
-				log.Printf("Jogador %s solicitou reset do jogo.", player.ID)
-				game.initializeItems()
-			}
-		}
-	}
-}
-
-// wsHandler lida com novas conexões WebSocket
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Falha ao fazer upgrade da conexão para WebSocket: %v", err)
+		log.Printf("Falha no upgrade: %v", err)
 		return
 	}
 
-	playerID := uuid.NewString() // Geração de ID com UUID
-	log.Printf("Novo jogador tentando conectar com ID gerado: %s", playerID)
-
+	playerID := uuid.NewString()
+	// addPlayer já está protegido por mutex e prepara o delta para outros jogadores
 	player := game.addPlayer(playerID, conn)
 
 	go writer(player)
 	go reader(player)
 
-	// Enviar uma mensagem inicial de "boas-vindas" com o ID do jogador
-	welcomeMsg := map[string]string{"type": "welcome", "playerId": player.ID}
+	welcomeMsg := ServerMessage{Type: MsgTypeWelcome, Payload: WelcomePayload{PlayerID: player.ID}}
 	welcomeData, _ := json.Marshal(welcomeMsg)
 	select {
 	case player.sendChan <- welcomeData:
 	default:
-		log.Printf("Não foi possível enviar mensagem de boas-vindas para %s", player.ID)
+		log.Printf("Canal de boas-vindas cheio para %s", player.ID)
+	}
+
+	// Enviar estado completo para o NOVO jogador
+	game.mu.Lock()                          // Lock para leitura consistente do estado
+	fullStatePayload := GameStateForClient{ // Usar o DTO
+		Players:     make(map[string]*Player), // Copiar jogadores para evitar problemas com json:"-" nos originais
+		Items:       game.Items,
+		BoardWidth:  game.BoardWidth,
+		BoardHeight: game.BoardHeight,
+		GameOver:    game.GameOver,
+		WinnerID:    game.WinnerID,
+	}
+	// Copia manual dos players para o DTO (apenas os campos serializáveis)
+	for id, p := range game.Players {
+		if p.IsActive { // Só envia jogadores ativos no estado completo inicial
+			playerCopy := *p // Copia para não enviar ponteiros para `conn` ou `sendChan`
+			playerCopy.conn = nil
+			playerCopy.sendChan = nil
+			fullStatePayload.Players[id] = &playerCopy
+		}
+	}
+
+	game.mu.Unlock()
+
+	fullStateMsg := ServerMessage{Type: MsgTypeFullState, Payload: fullStatePayload}
+	fullStateData, err := json.Marshal(fullStateMsg)
+	if err != nil {
+		log.Printf("Erro ao serializar estado completo para %s: %v", player.ID, err)
+		return
+	}
+	select {
+	case player.sendChan <- fullStateData:
+	default:
+		log.Printf("Canal de estado completo cheio para %s", player.ID)
 	}
 }
 
-// gameLoop é a goroutine principal do jogo que periodicamente envia o estado
+func broadcastUpdates() {
+	game.mu.Lock()
+	if len(game.pendingDeltas.PlayersUpdated) == 0 &&
+		len(game.pendingDeltas.PlayersRemoved) == 0 &&
+		len(game.pendingDeltas.ItemsAdded) == 0 &&
+		len(game.pendingDeltas.ItemsRemoved) == 0 &&
+		game.pendingDeltas.GameStatus == nil {
+		game.mu.Unlock()
+		return
+	}
+
+	deltasToSend := game.pendingDeltas // Copia os deltas
+	game.resetPendingDeltas()          // Reseta o acumulador para o próximo ciclo
+	game.mu.Unlock()                   // Libera o lock antes de enviar
+
+	deltaMsg := ServerMessage{Type: MsgTypeDeltaUpdate, Payload: deltasToSend}
+	messageData, err := json.Marshal(deltaMsg)
+	if err != nil {
+		log.Printf("Erro ao serializar deltas: %v", err)
+		return
+	}
+
+	// Re-adquirir lock para iterar sobre a lista de jogadores de forma segura
+	// Ou, melhor ainda, obter uma lista de canais de envio sob o lock
+	var activePlayerChans []chan []byte
+	game.mu.Lock()
+	for _, p := range game.Players {
+		if p.IsActive {
+			activePlayerChans = append(activePlayerChans, p.sendChan)
+		}
+	}
+	game.mu.Unlock()
+
+	if len(deltasToSend.PlayersUpdated) > 0 || len(deltasToSend.PlayersRemoved) > 0 || len(deltasToSend.ItemsAdded) > 0 || len(deltasToSend.ItemsRemoved) > 0 || deltasToSend.GameStatus != nil {
+		//log.Printf("Enviando deltas: %+v", deltasToSend) // Log pode ser verboso
+	}
+
+	for _, ch := range activePlayerChans {
+		select {
+		case ch <- messageData:
+		default:
+			// Não podemos identificar o jogador aqui facilmente sem o objeto Player
+			// Se o log for crucial, a iteração original sobre game.Players (com lock) é melhor
+			log.Println("Um canal de jogador estava cheio ao enviar deltas.")
+		}
+	}
+}
+
 func gameLoop() {
+	game.mu.Lock()
+	game.Players = make(map[string]*Player) // Inicializa o mapa de jogadores
+	game.Items = make(map[string]*Item)     // Inicializa o mapa de itens
+	game.resetPendingDeltas()               // Inicializa os deltas pendentes
+	game.mu.Unlock()
+
+	game.initializeItems() // Popula os itens iniciais e prepara o primeiro delta (para um possível broadcast se houvesse jogadores)
+
 	ticker := time.NewTicker(GameTickDelay)
 	defer ticker.Stop()
-
 	for {
 		<-ticker.C
-		game.broadcastGameState()
+		broadcastUpdates()
 	}
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	game.initializeItems()
+	// game.initializeItems() // Movido para dentro do gameLoop para garantir que maps estejam inicializados
 
-	http.HandleFunc("/ws", wsHandler)                                   // Endpoint WebSocket
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { // Servir o cliente HTML
+	http.HandleFunc("/ws", wsHandler)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
+		// A string HTML permanece a mesma da sua última versão com UI/UX melhorado
+		// Lembre-se que o JavaScript do cliente precisará ser ATUALIZADO
+		// para lidar com os novos tipos de mensagem: "welcome", "full_state", "delta_update"
+		// e para manter um 'localGameState'.
 		html := `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -466,12 +546,12 @@ func main() {
             width: 100%;
         }
         #board-wrapper { 
-            width: auto; /* Ajusta-se ao conteúdo */
-            max-width: 100%; /* Não ultrapassa a tela */
+            width: auto; 
+            max-width: 100%; 
             overflow-x: auto; 
             display: flex;
             justify-content: center; 
-            padding: 5px; /* Pequeno padding para não cortar a borda do tabuleiro */
+            padding: 5px; 
             background-color: var(--secondary-bg);
             border-radius: 8px;
             box-shadow: 0 2px 4px var(--shadow-color);
@@ -480,10 +560,10 @@ func main() {
             border-collapse: collapse;
             font-family: monospace;
             table-layout: fixed; 
-            border: 1px solid var(--border-color); /* Borda mais suave */
+            border: 1px solid var(--border-color); 
         }
         #board td {
-            border: 1px solid #e7e7e7; /* Linhas de grade ainda mais suaves */
+            border: 1px solid #e7e7e7; 
             width: 30px;   
             height: 30px;  
             text-align: center;
@@ -543,7 +623,7 @@ func main() {
             background-color: var(--accent-color); 
             color: white;
             transition: background-color 0.2s ease, transform 0.1s ease;
-            min-width: 80px; /* Largura mínima para botões de controle */
+            min-width: 80px; 
         }
         #controls button:hover { background-color: var(--accent-hover); }
         #controls button:active { transform: scale(0.95); }
@@ -571,16 +651,15 @@ func main() {
             font-size: 1.2em; 
             border-radius: 5px;
             text-align: center;
-            display: none; /* Escondido por padrão, JS mostra */
+            display: none; 
         }
         #resetButton {
-            background-color: #5bc0de; /* Azul informativo */
+            background-color: #5bc0de; 
         }
         #resetButton:hover {
             background-color: #31b0d5;
         }
 
-        /* === Media Queries para Responsividade === */
         @media (max-width: 768px) {
             body { padding: 15px; }
             h1 { font-size: 1.8em; }
@@ -626,7 +705,7 @@ func main() {
                 width: 100%; 
                 height: 55px; 
                 font-size: 1em;
-                display: flex; /* Para centralizar ícone/texto */
+                display: flex; 
                 align-items: center;
                 justify-content: center;
             }
@@ -691,10 +770,14 @@ func main() {
         </div>
     </div>
     <div id="controls">
-        <button id="btn-up" onclick="sendMove('up')" title="Mover para Cima (W ou Seta para Cima)">&#x25B2;</button> <br> 
-        <button id="btn-left" onclick="sendMove('left')" title="Mover para Esquerda (A ou Seta para Esquerda)">&#x25C0;</button> <span id="btn-placeholder"></span> 
-        <button id="btn-right" onclick="sendMove('right')" title="Mover para Direita (D ou Seta para Direita)">&#x25B6;</button> <br> 
-        <button id="btn-down" onclick="sendMove('down')" title="Mover para Baixo (S ou Seta para Baixo)">&#x25BC;</button> </div>
+        <button id="btn-up" onclick="sendMove('up')" title="Mover para Cima (W ou Seta para Cima)">&#x25B2;</button> 
+        <br> 
+        <button id="btn-left" onclick="sendMove('left')" title="Mover para Esquerda (A ou Seta para Esquerda)">&#x25C0;</button> 
+        <span id="btn-placeholder"></span> 
+        <button id="btn-right" onclick="sendMove('right')" title="Mover para Direita (D ou Seta para Direita)">&#x25B6;</button> 
+        <br> 
+        <button id="btn-down" onclick="sendMove('down')" title="Mover para Baixo (S ou Seta para Baixo)">&#x25BC;</button> 
+    </div>
     <div id="log-container">
       <h4>Log de Eventos (Debug):</h4>
       <pre id="log"></pre>
@@ -703,7 +786,7 @@ func main() {
     <script>
         const boardElement = document.getElementById('board');
         const scoresElement = document.getElementById('scores');
-        const logElement = document.getElementById('log'); // Log na tela
+        const logElement = document.getElementById('log'); 
         const myIdElement = document.getElementById('my-id');
         const gameOverMsgElement = document.getElementById('game-over-msg');
         const resetButton = document.getElementById('resetButton');
@@ -712,8 +795,18 @@ func main() {
         const ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
         let myPlayerId = null;
 
+        // Variável para manter o estado local do jogo no cliente
+        let localGameState = {
+            players: {},
+            items: {},
+            boardWidth: ${BoardWidth}, // Inicializa com constantes do Go
+            boardHeight: ${BoardHeight},
+            gameOver: false,
+            winnerId: null
+        };
+
         function clientLog(message) {
-            console.log(message); // Log no console do navegador
+            console.log(message); 
             const now = new Date();
             const timeString = now.getHours().toString().padStart(2, '0') + ':' + 
                                now.getMinutes().toString().padStart(2, '0') + ':' + 
@@ -724,18 +817,18 @@ func main() {
             logElement.textContent = timeString + ": " + message + "\n" + logElement.textContent;
         }
 
-        function drawBoard(gameState) {
+        function drawBoard(gameStateToDraw) { // Agora usa o estado passado como argumento
             boardElement.innerHTML = ''; 
-            for (let y = 0; y < gameState.boardHeight; y++) {
+            for (let y = 0; y < gameStateToDraw.boardHeight; y++) {
                 const row = boardElement.insertRow();
-                for (let x = 0; x < gameState.boardWidth; x++) {
+                for (let x = 0; x < gameStateToDraw.boardWidth; x++) {
                     const cell = row.insertCell();
                     cell.id = 'cell-' + x + '-' + y;
                 }
             }
 
-            for (const key in gameState.items) {
-                const item = gameState.items[key];
+            for (const key in gameStateToDraw.items) {
+                const item = gameStateToDraw.items[key];
                 const cell = document.getElementById('cell-' + item.pos.x + '-' + item.pos.y);
                 if (cell) {
                     cell.classList.add('item');
@@ -744,8 +837,8 @@ func main() {
             }
             
             let scoresHTML = "";
-            for (const id in gameState.players) {
-                const player = gameState.players[id];
+            for (const id in gameStateToDraw.players) {
+                const player = gameStateToDraw.players[id];
                 const cell = document.getElementById('cell-' + player.pos.x + '-' + player.pos.y);
                 if (cell) {
                     cell.classList.add('player');
@@ -758,12 +851,13 @@ func main() {
             }
             scoresElement.textContent = scoresHTML;
 
-            if (gameState.gameOver) {
-                gameOverMsgElement.textContent = "FIM DE JOGO! Vencedor(es): " + gameState.winnerId;
-                resetButton.style.display = 'inline-block'; // Mostrar botão
+            if (gameStateToDraw.gameOver) {
+                gameOverMsgElement.textContent = "FIM DE JOGO! Vencedor(es): " + gameStateToDraw.winnerId;
+                gameOverMsgElement.style.display = 'block'; 
+                resetButton.style.display = 'inline-block'; 
             } else {
-                gameOverMsgElement.textContent = "";
-                resetButton.style.display = 'none'; // Esconder botão
+                gameOverMsgElement.style.display = 'none'; 
+                resetButton.style.display = 'none'; 
             }
         }
 
@@ -772,15 +866,73 @@ func main() {
         };
 
         ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
+            const serverMsg = JSON.parse(event.data);
             
-            if (data.type === "welcome") {
-                myPlayerId = data.playerId;
-                myIdElement.textContent = myPlayerId.substring(0,8) + "..."; // Mostra ID abreviado
-                clientLog("Meu ID de jogador definido: " + myPlayerId);
-                return; 
+            if (serverMsg.type === "welcome") {
+                myPlayerId = serverMsg.payload.playerId;
+                myIdElement.textContent = myPlayerId.substring(0,8) + "..."; 
+                clientLog("Bem-vindo! Seu ID: " + myPlayerId + ". Aguardando estado completo do jogo...");
+                // Não desenha o tabuleiro ainda, espera pelo full_state
+            } else if (serverMsg.type === "full_state") {
+                clientLog("Recebido Estado Completo do Jogo.");
+                localGameState.players = serverMsg.payload.players || {};
+                localGameState.items = serverMsg.payload.items || {};
+                localGameState.boardWidth = serverMsg.payload.boardWidth;
+                localGameState.boardHeight = serverMsg.payload.boardHeight;
+                localGameState.gameOver = serverMsg.payload.gameOver;
+                localGameState.winnerId = serverMsg.payload.winnerId;
+                drawBoard(localGameState); 
+            } else if (serverMsg.type === "delta_update") {
+                // clientLog("Recebido Delta Update: " + JSON.stringify(serverMsg.payload));
+                const delta = serverMsg.payload;
+
+                if (delta.playersUpdated) {
+                    for (const playerId in delta.playersUpdated) {
+                        const pDelta = delta.playersUpdated[playerId];
+                        if (!localGameState.players[playerId]) { 
+                            localGameState.players[playerId] = { id: playerId, score: 0, pos: {x:0, y:0} }; // Inicializa se não existe
+                            clientLog("Novo jogador via delta: " + playerId);
+                        }
+                        if (pDelta.pos) {
+                            localGameState.players[playerId].pos = pDelta.pos;
+                        }
+                        if (pDelta.score !== undefined && pDelta.score !== null) { 
+                            localGameState.players[playerId].score = pDelta.score;
+                        }
+                    }
+                }
+
+                if (delta.playersRemoved) {
+                    delta.playersRemoved.forEach(playerId => {
+                        delete localGameState.players[playerId];
+                        clientLog("Jogador removido via delta: " + playerId);
+                    });
+                }
+                
+                // Para ItemsAdded, especialmente no reset, é melhor substituir todos os itens.
+                // Se fosse adição incremental de itens durante o jogo, seria diferente.
+                if (delta.itemsAdded && delta.itemsAdded.length > 0) {
+                    clientLog("Itens adicionados/resetados via delta. Total: " + delta.itemsAdded.length);
+                    localGameState.items = {}; // Limpa itens existentes antes de adicionar os novos
+                    delta.itemsAdded.forEach(item => {
+                        const itemKey = item.pos.x + "," + item.pos.y; // Usa a posição como chave, como no servidor
+                        localGameState.items[itemKey] = item;
+                    });
+                }
+                
+                if (delta.itemsRemoved) {
+                    delta.itemsRemoved.forEach(itemKey => { 
+                        delete localGameState.items[itemKey];
+                    });
+                }
+
+                if (delta.gameStatus) {
+                    localGameState.gameOver = delta.gameStatus.gameOver;
+                    localGameState.winnerId = delta.gameStatus.winnerId;
+                }
+                
+                drawBoard(localGameState); 
             }
-            drawBoard(data);
         };
 
         ws.onclose = function(event) {
@@ -833,17 +985,16 @@ func main() {
 		fmt.Fprint(w, html)
 	})
 
-	// Determina a porta para escutar
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Porta padrão se PORT não estiver definida
+		port = "8080"
 		log.Printf("Variável PORT não definida, usando porta padrão: %s", port)
 	}
 
-	go gameLoop() // Inicia o loop principal do jogo em uma goroutine separada
+	go gameLoop()
 
 	log.Printf("Servidor Go Diamond Collector iniciando na porta :%s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("Erro ao iniciar servidor ListenAndServe: %v", err) // Usar log.Fatalf para sair em caso de erro fatal
+		log.Fatalf("Erro ao iniciar servidor ListenAndServe: %v", err)
 	}
 }
