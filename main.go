@@ -6,48 +6,44 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	"os" // Importado para usar os.Getenv("PORT")
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/google/uuid" // Importar UUID
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 const (
-	BoardWidth    = 20                     // Largura do tabuleiro
-	BoardHeight   = 15                     // Altura do tabuleiro
-	NumItems      = 15                     // Número inicial de itens
-	GameTickDelay = 150 * time.Millisecond // Intervalo para enviar atualizações de estado
+	BoardWidth    = 20
+	BoardHeight   = 15
+	NumItems      = 15
+	GameTickDelay = 150 * time.Millisecond
 )
 
-// Point representa uma coordenada no tabuleiro
 type Point struct {
 	X int `json:"x"`
 	Y int `json:"y"`
 }
 
-// Player representa um jogador no jogo
 type Player struct {
 	ID       string          `json:"id"`
 	Pos      Point           `json:"pos"`
 	Score    int             `json:"score"`
-	conn     *websocket.Conn `json:"-"`        // Conexão WebSocket (não serializada para JSON)
-	sendChan chan []byte     `json:"-"`        // Canal para enviar mensagens para este jogador
-	IsActive bool            `json:"isActive"` // Indica se o jogador está ativo
+	conn     *websocket.Conn `json:"-"`
+	sendChan chan []byte     `json:"-"`
+	IsActive bool            `json:"isActive"`
 }
 
-// Item representa um item coletável
 type Item struct {
 	ID  string `json:"id"`
 	Pos Point  `json:"pos"`
 }
 
-// GameState armazena o estado atual do jogo
 type GameState struct {
 	Players     map[string]*Player `json:"players"`
-	Items       map[string]*Item   `json:"items"` // Chave: "x,y" para fácil busca
+	Items       map[string]*Item   `json:"items"`
 	BoardWidth  int                `json:"boardWidth"`
 	BoardHeight int                `json:"boardHeight"`
 	GameOver    bool               `json:"gameOver"`
@@ -55,13 +51,11 @@ type GameState struct {
 	mu          sync.Mutex         // Mutex para proteger o acesso concorrente ao estado
 }
 
-// ClientMessage é a estrutura para mensagens enviadas pelo cliente
 type ClientMessage struct {
-	Action    string `json:"action"`    // Ex: "move"
-	Direction string `json:"direction"` // Ex: "up", "down", "left", "right"
+	Action    string `json:"action"`
+	Direction string `json:"direction"`
 }
 
-// Variável global para o estado do jogo
 var game = &GameState{
 	Players:     make(map[string]*Player),
 	Items:       make(map[string]*Item),
@@ -70,10 +64,9 @@ var game = &GameState{
 	GameOver:    false,
 }
 
-// Upgrader do WebSocket (permite todas as origens para simplicidade)
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Permite todas as origens para este exemplo
+		return true
 	},
 }
 
@@ -81,6 +74,7 @@ var upgrader = websocket.Upgrader{
 func (gs *GameState) initializeItems() {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
+
 	gs.Items = make(map[string]*Item)
 	for i := 0; i < NumItems; i++ {
 		var itemPos Point
@@ -105,12 +99,19 @@ func (gs *GameState) initializeItems() {
 		itemKey := fmt.Sprintf("%d,%d", itemPos.X, itemPos.Y)
 		gs.Items[itemKey] = &Item{ID: itemID, Pos: itemPos}
 	}
+
 	gs.GameOver = false
 	gs.WinnerID = ""
-	log.Printf("Jogo iniciado/resetado com %d itens.", len(gs.Items))
+
+	for _, player := range gs.Players {
+		if player.IsActive {
+			player.Score = 0
+		}
+	}
+
+	log.Printf("Jogo iniciado/resetado com %d itens. Pontuações dos jogadores zeradas.", len(gs.Items))
 }
 
-// addPlayer adiciona um novo jogador ao jogo
 func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
@@ -151,7 +152,6 @@ func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
 	return player
 }
 
-// removePlayer remove um jogador do jogo
 func (gs *GameState) removePlayer(id string) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
@@ -164,7 +164,6 @@ func (gs *GameState) removePlayer(id string) {
 	}
 }
 
-// handlePlayerMove processa o movimento de um jogador
 func (gs *GameState) handlePlayerMove(playerID string, direction string) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
@@ -393,97 +392,311 @@ func main() {
 			http.NotFound(w, r)
 			return
 		}
-		// Conteúdo HTML com correções de CSS e meta charset
 		html := `
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Go Concurrent Game</title>
+    <title>Go Diamond Collector</title>
     <style>
-        body { font-family: Arial, sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; background-color: #f0f0f0; }
-        h1 { margin-bottom: 10px;}
-        p { margin-bottom: 15px; }
-        #game-container { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center;}
+        :root {
+            --primary-bg: #f4f7f6;
+            --secondary-bg: #ffffff;
+            --accent-color: #3498db; /* Azul suave */
+            --accent-hover: #2980b9;
+            --text-color: #333333;
+            --border-color: #dddddd;
+            --item-bg: #f1c40f; /* Dourado para itens */
+            --player-bg: #87ceeb; /* Azul céu para jogador */
+            --self-player-bg: #5dade2; /* Azul mais forte para jogador local */
+            --shadow-color: rgba(0,0,0,0.1);
+        }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            margin: 0; 
+            padding: 20px; 
+            background-color: var(--primary-bg); 
+            color: var(--text-color);
+            line-height: 1.6;
+        }
+        h1 { 
+            margin-bottom: 0.5em;
+            font-size: 2.2em; 
+            color: var(--accent-color);
+            font-weight: 300;
+        }
+        #game-description {
+            background-color: var(--secondary-bg);
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 25px;
+            max-width: 700px;
+            box-shadow: 0 2px 4px var(--shadow-color);
+            text-align: left;
+        }
+        #game-description h2 {
+            margin-top: 0;
+            color: var(--accent-color);
+            font-size: 1.4em;
+            font-weight: 400;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 0.5em;
+            margin-bottom: 0.8em;
+        }
+        #game-description p, #game-description ul {
+            font-size: 0.95em;
+            margin-bottom: 0.8em;
+        }
+        #game-description ul {
+            list-style-type: disc;
+            padding-left: 20px;
+        }
+        #game-description strong {
+            color: var(--accent-color);
+        }
+        #game-container { 
+            display: flex; 
+            flex-wrap: wrap; 
+            gap: 25px; 
+            justify-content: center;
+            width: 100%;
+        }
+        #board-wrapper { 
+            width: auto; /* Ajusta-se ao conteúdo */
+            max-width: 100%; /* Não ultrapassa a tela */
+            overflow-x: auto; 
+            display: flex;
+            justify-content: center; 
+            padding: 5px; /* Pequeno padding para não cortar a borda do tabuleiro */
+            background-color: var(--secondary-bg);
+            border-radius: 8px;
+            box-shadow: 0 2px 4px var(--shadow-color);
+        }
         #board {
             border-collapse: collapse;
             font-family: monospace;
-            table-layout: fixed; /* Importante para células respeitarem a largura */
-            border: 2px solid #333;
+            table-layout: fixed; 
+            border: 1px solid var(--border-color); /* Borda mais suave */
         }
         #board td {
-            border: 1px solid #ccc;
-            width: 28px;   /* Ajustado para melhor visualização */
-            height: 28px;  /* Ajustado para melhor visualização */
+            border: 1px solid #e7e7e7; /* Linhas de grade ainda mais suaves */
+            width: 30px;   
+            height: 30px;  
             text-align: center;
             vertical-align: middle;
-            font-size: 14px; /* Ajustado para melhor visualização do emoji/texto */
+            font-size: 16px; 
             overflow: hidden; 
             box-sizing: border-box; 
             white-space: nowrap; 
-            line-height: 26px; /* (height - border), ajuda a centralizar */
+            line-height: 28px; 
         }
-        .player { background-color: lightblue; border-radius: 50%; }
-        .item { background-color: gold; }
-        .self { font-weight: bold; background-color: #66ccff; box-shadow: 0 0 3px 2px cyan; } /* Destaque para o jogador local */
+        .player { background-color: var(--player-bg); border-radius: 50%; }
+        .item { background-color: var(--item-bg); color: white; border-radius: 3px; animation: pulseItem 1.5s infinite ease-in-out; }
+        .self { font-weight: bold; background-color: var(--self-player-bg); box-shadow: 0 0 5px 3px var(--accent-hover); } 
+        @keyframes pulseItem {
+            0% { transform: scale(0.9); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(0.9); }
+        }
         #info { 
-            margin-top: 0px; /* Ajustado */
             text-align: left; 
-            padding: 15px; 
-            border: 1px solid #ddd; 
-            background-color: #fff; 
-            border-radius: 5px;
-            min-width: 250px; /* Largura mínima para o painel de informações */
+            padding: 20px; 
+            border: 1px solid var(--border-color); 
+            background-color: var(--secondary-bg); 
+            border-radius: 8px; 
+            min-width: 280px; 
+            box-shadow: 0 2px 4px var(--shadow-color);
         }
-        #info h3 { margin-top: 0; margin-bottom: 5px; }
-        #info pre { margin-top: 5px; margin-bottom: 10px; white-space: pre-wrap; }
-        #controls { margin-top: 20px; text-align: center; }
-        #controls button { 
-            padding: 10px 15px; 
-            margin: 5px; 
-            font-size: 16px; 
-            cursor: pointer; 
-            border: 1px solid #ccc;
+        #info h3 { 
+            margin-top: 0; 
+            margin-bottom: 10px; 
+            font-size: 1.3em;
+            color: var(--accent-color);
+            font-weight: 400;
+        }
+        #info pre { 
+            margin-top: 5px; 
+            margin-bottom: 15px; 
+            white-space: pre-wrap; 
+            background-color: #f9f9f9; 
+            padding: 10px;
             border-radius: 4px;
-            background-color: #e9e9e9;
+            font-size: 0.9em;
+            border: 1px solid #efefef;
         }
-        #controls button:hover { background-color: #dcdcdc; }
-        #log-container { width: 100%; max-width: 600px; margin-top:20px; }
+        #controls { 
+            margin-top: 25px; 
+            text-align: center; 
+            width: 100%; 
+        }
+        #controls button { 
+            padding: 12px 20px; 
+            margin: 8px; 
+            font-size: 1.05em; 
+            cursor: pointer; 
+            border: none; 
+            border-radius: 5px;
+            background-color: var(--accent-color); 
+            color: white;
+            transition: background-color 0.2s ease, transform 0.1s ease;
+            min-width: 80px; /* Largura mínima para botões de controle */
+        }
+        #controls button:hover { background-color: var(--accent-hover); }
+        #controls button:active { transform: scale(0.95); }
+
+        #log-container { width: 100%; max-width: 700px; margin-top:25px; }
         #log { 
-            font-size:0.8em; 
-            max-height: 100px; 
+            font-size:0.85em; 
+            max-height: 120px; 
             overflow-y: scroll; 
-            border: 1px solid #eee; 
+            border: 1px solid var(--border-color); 
             padding:10px; 
-            background-color: #fff;
+            background-color: var(--secondary-bg);
             white-space: pre-wrap; 
             word-break: break-all;
+            border-radius: 4px;
+            font-family: monospace;
         }
-        #game-over-msg { color:red; font-weight:bold; margin-bottom: 10px; }
+        #game-over-msg { 
+            padding: 15px;
+            background-color: #ffdddd;
+            border: 1px solid #ffaaaa;
+            color: #d8000c; 
+            font-weight:bold; 
+            margin-bottom: 15px; 
+            font-size: 1.2em; 
+            border-radius: 5px;
+            text-align: center;
+            display: none; /* Escondido por padrão, JS mostra */
+        }
+        #resetButton {
+            background-color: #5bc0de; /* Azul informativo */
+        }
+        #resetButton:hover {
+            background-color: #31b0d5;
+        }
+
+        /* === Media Queries para Responsividade === */
+        @media (max-width: 768px) {
+            body { padding: 15px; }
+            h1 { font-size: 1.8em; }
+            #game-description { width: 95%; padding: 15px; margin-bottom: 20px;}
+            #game-description h2 { font-size: 1.3em; }
+            #game-description p, #game-description ul { font-size: 0.9em; }
+
+            #game-container {
+                flex-direction: column; 
+                align-items: center;
+                gap: 20px;
+            }
+            #board-wrapper { margin-bottom: 20px; }
+            #board td {
+                width: 26px;  
+                height: 26px;
+                font-size: 14px; 
+                line-height: 24px;
+            }
+            #info {
+                width: 90%; 
+                max-width: 480px; 
+                min-width: unset;
+                padding: 15px;
+            }
+             #info h3 { font-size: 1.2em; }
+
+            #controls {
+                display: grid;
+                grid-template-columns: 1fr 1fr 1fr;
+                grid-template-rows: auto auto auto;
+                gap: 10px; 
+                max-width: 250px; 
+                margin-left: auto;
+                margin-right: auto;
+                padding: 15px;
+                background-color: var(--secondary-bg);
+                border-radius: 10px;
+                box-shadow: 0 2px 4px var(--shadow-color);
+            }
+            #controls button {
+                margin: 0; 
+                width: 100%; 
+                height: 55px; 
+                font-size: 1em;
+                display: flex; /* Para centralizar ícone/texto */
+                align-items: center;
+                justify-content: center;
+            }
+            #btn-up    { grid-column: 2; grid-row: 1; }
+            #btn-left  { grid-column: 1; grid-row: 2; }
+            #btn-placeholder { grid-column: 2; grid-row: 2; visibility: hidden; } 
+            #btn-right { grid-column: 3; grid-row: 2; }
+            #btn-down  { grid-column: 2; grid-row: 3; }
+
+            #controls br { display: none; } 
+        }
+
+        @media (max-width: 480px) {
+            h1 { font-size: 1.6em; }
+            #game-description h2 { font-size: 1.2em; }
+            #board td {
+                width: 22px;  
+                height: 22px;
+                font-size: 12px;
+                line-height: 20px;
+            }
+            #controls {
+                max-width: 220px; 
+                gap: 8px;
+                padding: 10px;
+            }
+            #controls button {
+                height: 50px;
+                font-size: 0.95em;
+            }
+            #info { width: 95%; padding: 12px; }
+             #info h3 { font-size: 1.1em; }
+             #info pre { font-size: 0.85em; padding: 8px;}
+        }
     </style>
 </head>
 <body>
-    <h1>Go Concurrent Game</h1>
-    <p>Use W, A, S, D ou as setas para mover. Abra em várias abas!</p>
+    <h1>Go Diamond Collector</h1>
+
+    <div id="game-description">
+        <h2>Como Jogar:</h2>
+        <p><strong>Objetivo:</strong> Ser o jogador com mais diamantes (💎) coletados quando todos os itens do tabuleiro acabarem!</p>
+        <ul>
+            <li>Use as teclas <strong>W, A, S, D</strong> ou as <strong>Setas Direcionais</strong> do teclado para se mover.</li>
+            <li>Em dispositivos móveis, use os <strong>botões de controle</strong> na tela.</li>
+            <li>Passe por cima de um diamante (💎) para coletá-lo e aumentar sua pontuação.</li>
+            <li>Fique de olho na pontuação dos outros jogadores!</li>
+            <li>O jogo termina quando não houver mais diamantes. O jogador com mais diamantes vence. Boa sorte!</li>
+        </ul>
+    </div>
+
     <div id="game-container">
-        <table id="board"></table>
+        <div id="board-wrapper"> 
+            <table id="board"></table>
+        </div>
         <div id="info">
             <h3>Seu ID: <span id="my-id">---</span></h3>
             <h3>Pontuações:</h3>
             <pre id="scores"></pre>
             <div id="game-over-msg"></div>
-            <button id="resetButton" style="display:none;">Resetar Jogo (se GameOver)</button>
+            <button id="resetButton" style="display:none;">Resetar Jogo</button>
         </div>
     </div>
     <div id="controls">
-        <button onclick="sendMove('up')" title="Mover para Cima (W ou Seta para Cima)">Up (W)</button><br>
-        <button onclick="sendMove('left')" title="Mover para Esquerda (A ou Seta para Esquerda)">Left (A)</button>
-        <button onclick="sendMove('down')" title="Mover para Baixo (S ou Seta para Baixo)">Down (S)</button>
-        <button onclick="sendMove('right')" title="Mover para Direita (D ou Seta para Direita)">Right (D)</button>
-    </div>
+        <button id="btn-up" onclick="sendMove('up')" title="Mover para Cima (W ou Seta para Cima)">&#x25B2;</button> <br> 
+        <button id="btn-left" onclick="sendMove('left')" title="Mover para Esquerda (A ou Seta para Esquerda)">&#x25C0;</button> <span id="btn-placeholder"></span> 
+        <button id="btn-right" onclick="sendMove('right')" title="Mover para Direita (D ou Seta para Direita)">&#x25B6;</button> <br> 
+        <button id="btn-down" onclick="sendMove('down')" title="Mover para Baixo (S ou Seta para Baixo)">&#x25BC;</button> </div>
     <div id="log-container">
-      <h4>Log de Eventos do Cliente (para debug):</h4>
+      <h4>Log de Eventos (Debug):</h4>
       <pre id="log"></pre>
     </div>
 
@@ -505,7 +718,10 @@ func main() {
             const timeString = now.getHours().toString().padStart(2, '0') + ':' + 
                                now.getMinutes().toString().padStart(2, '0') + ':' + 
                                now.getSeconds().toString().padStart(2, '0');
-            logElement.textContent = timeString + ": " + message + "\n" + logElement.textContent.substring(0, 2000);
+            if (logElement.textContent.length > 2000) { 
+                logElement.textContent = logElement.textContent.substring(0,1500);
+            }
+            logElement.textContent = timeString + ": " + message + "\n" + logElement.textContent;
         }
 
         function drawBoard(gameState) {
@@ -560,7 +776,7 @@ func main() {
             
             if (data.type === "welcome") {
                 myPlayerId = data.playerId;
-                myIdElement.textContent = myPlayerId;
+                myIdElement.textContent = myPlayerId.substring(0,8) + "..."; // Mostra ID abreviado
                 clientLog("Meu ID de jogador definido: " + myPlayerId);
                 return; 
             }
@@ -570,6 +786,7 @@ func main() {
         ws.onclose = function(event) {
             clientLog("Desconectado do servidor WebSocket. Código: " + event.code + " Razão: " + event.reason);
             gameOverMsgElement.textContent = "DESCONECTADO DO SERVIDOR";
+            gameOverMsgElement.style.display = 'block';
         };
 
         ws.onerror = function(error) {
@@ -612,7 +829,7 @@ func main() {
 </body>
 </html>
 `
-		w.Header().Set("Content-Type", "text/html; charset=utf-8") // Garante que o header HTTP também indique UTF-8
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, html)
 	})
 
@@ -625,7 +842,7 @@ func main() {
 
 	go gameLoop() // Inicia o loop principal do jogo em uma goroutine separada
 
-	log.Printf("Servidor Go Concurrent Game iniciando na porta :%s", port)
+	log.Printf("Servidor Go Diamond Collector iniciando na porta :%s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("Erro ao iniciar servidor ListenAndServe: %v", err) // Usar log.Fatalf para sair em caso de erro fatal
 	}
