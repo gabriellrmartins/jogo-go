@@ -6,10 +6,9 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os" // Importado para usar os.Getenv("PORT")
 	"strconv"
 	"sync"
-
-	// "sync/atomic" // Não usaremos com UUID, mas mantido para referência de alternativas
 	"time"
 
 	"github.com/google/uuid" // Importar UUID
@@ -74,7 +73,7 @@ var game = &GameState{
 // Upgrader do WebSocket (permite todas as origens para simplicidade)
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return true // Permite todas as origens para este exemplo
 	},
 }
 
@@ -148,7 +147,7 @@ func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
 		IsActive: true,
 	}
 	gs.Players[id] = player
-	log.Printf("Jogador %s (%s) entrou em (%d, %d). Total de jogadores: %d", player.ID, id, player.Pos.X, player.Pos.Y, len(gs.Players))
+	log.Printf("Jogador %s entrou em (%d, %d). Total de jogadores: %d", id, player.Pos.X, player.Pos.Y, len(gs.Players))
 	return player
 }
 
@@ -388,8 +387,8 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 	game.initializeItems()
 
-	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/ws", wsHandler)                                   // Endpoint WebSocket
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { // Servir o cliente HTML
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
@@ -558,7 +557,6 @@ func main() {
 
         ws.onmessage = function(event) {
             const data = JSON.parse(event.data);
-            // clientLog("Recebido Raw: " + event.data.substring(0,100) + "..."); 
             
             if (data.type === "welcome") {
                 myPlayerId = data.playerId;
@@ -566,7 +564,6 @@ func main() {
                 clientLog("Meu ID de jogador definido: " + myPlayerId);
                 return; 
             }
-            // clientLog("Recebido GameState, Meu ID atual: " + myPlayerId);
             drawBoard(data);
         };
 
@@ -588,7 +585,6 @@ func main() {
                 clientLog("Meu ID de jogador ainda não está definido. Não é possível enviar movimento.");
                 return;
             }
-            // clientLog("Enviando movimento: " + direction + " como jogador " + myPlayerId);
             ws.send(JSON.stringify({ action: 'move', direction: direction }));
         }
         
@@ -620,10 +616,17 @@ func main() {
 		fmt.Fprint(w, html)
 	})
 
-	go gameLoop()
+	// Determina a porta para escutar
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Porta padrão se PORT não estiver definida
+		log.Printf("Variável PORT não definida, usando porta padrão: %s", port)
+	}
 
-	log.Println("Servidor Go Concurrent Game iniciado em http://localhost:8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("Erro ao iniciar servidor ListenAndServe:", err)
+	go gameLoop() // Inicia o loop principal do jogo em uma goroutine separada
+
+	log.Printf("Servidor Go Concurrent Game iniciando na porta :%s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Erro ao iniciar servidor ListenAndServe: %v", err) // Usar log.Fatalf para sair em caso de erro fatal
 	}
 }
