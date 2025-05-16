@@ -72,7 +72,6 @@ type PlayerDelta struct {
 	ID    string `json:"id"`
 	Pos   *Point `json:"pos,omitempty"`
 	Score *int   `json:"score,omitempty"`
-	// IsNew bool `json:"isNew,omitempty"` // Opcional: para o cliente distinguir
 }
 
 type GameStatusDelta struct {
@@ -141,9 +140,9 @@ func (gs *GameState) initializeItems() {
 		for !uniquePos {
 			itemPos = Point{X: rand.Intn(BoardWidth), Y: rand.Intn(BoardHeight)}
 			key := fmt.Sprintf("%d,%d", itemPos.X, itemPos.Y)
-			_, currentExists := currentItems[key] // Verifica no mapa de novos itens desta rodada
+			_, currentExists := currentItems[key]
 			playerOccupies := false
-			for _, p := range gs.Players { // Ainda verifica contra jogadores existentes
+			for _, p := range gs.Players {
 				if p.Pos.X == itemPos.X && p.Pos.Y == itemPos.Y {
 					playerOccupies = true
 					break
@@ -159,12 +158,21 @@ func (gs *GameState) initializeItems() {
 		currentItems[itemKey] = &newItem
 		newItemsListForDelta = append(newItemsListForDelta, newItem)
 	}
-	gs.Items = currentItems // Atribui o novo conjunto de itens
+	gs.Items = currentItems
 	gs.pendingDeltas.ItemsAdded = newItemsListForDelta
 
 	gs.GameOver = false
 	gs.WinnerID = ""
-	gs.pendingDeltas.GameStatus = &GameStatusDelta{GameOver: false, WinnerID: ""}
+	// Garante que GameStatus seja inicializado se for nil no delta
+	if gs.pendingDeltas.GameStatus == nil && (gs.GameOver || gs.WinnerID != "") { // Condição para criar
+		gs.pendingDeltas.GameStatus = &GameStatusDelta{}
+	}
+	if gs.pendingDeltas.GameStatus != nil { // Atualiza se já existe
+		gs.pendingDeltas.GameStatus.GameOver = false
+		gs.pendingDeltas.GameStatus.WinnerID = ""
+	} else { // Cria se não existe e precisa ser criado
+		gs.pendingDeltas.GameStatus = &GameStatusDelta{GameOver: false, WinnerID: ""}
+	}
 
 	for playerID, player := range gs.Players {
 		if player.IsActive {
@@ -184,14 +192,14 @@ func (gs *GameState) initializeItems() {
 func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
 	var startPos Point
 	uniquePos := false
-	// Trava para achar posição inicial e adicionar jogador de forma segura
-	gs.mu.Lock()
-	defer gs.mu.Unlock() // Será liberado após a adição do jogador e atualização do delta
+
+	gs.mu.Lock() // Bloqueia para encontrar posição e modificar estado
+	defer gs.mu.Unlock()
 
 	for !uniquePos {
 		startPos = Point{X: rand.Intn(BoardWidth), Y: rand.Intn(BoardHeight)}
 		occupied := false
-		for _, p := range gs.Players {
+		for _, p := range gs.Players { // Verifica jogadores existentes
 			if p.Pos.X == startPos.X && p.Pos.Y == startPos.Y {
 				occupied = true
 				break
@@ -203,7 +211,7 @@ func (gs *GameState) addPlayer(id string, conn *websocket.Conn) *Player {
 		itemKey := fmt.Sprintf("%d,%d", startPos.X, startPos.Y)
 		if _, exists := gs.Items[itemKey]; exists {
 			occupied = true
-		}
+		} // Verifica itens existentes
 		if !occupied {
 			uniquePos = true
 		}
@@ -241,6 +249,9 @@ func (gs *GameState) removePlayer(id string) {
 		close(player.sendChan)
 		delete(gs.Players, id)
 		gs.pendingDeltas.PlayersRemoved = append(gs.pendingDeltas.PlayersRemoved, id)
+
+		// Remove o jogador de PlayersUpdated se ele acabou de entrar e saiu antes de um broadcast
+		delete(gs.pendingDeltas.PlayersUpdated, id)
 		log.Printf("Jogador %s removido. Delta de remoção preparado.", id)
 	}
 }
@@ -306,7 +317,7 @@ func (gs *GameState) handlePlayerMove(playerID string, direction string) {
 		gs.pendingDeltas.PlayersUpdated[playerID] = delta
 
 		gs.pendingDeltas.ItemsRemoved = append(gs.pendingDeltas.ItemsRemoved, itemKey)
-		log.Printf("Jogador %s coletou item. Deltas preparados.", player.ID)
+		// log.Printf("Jogador %s coletou item. Deltas preparados.", player.ID) // Log pode ser muito verboso aqui
 
 		if len(gs.Items) == 0 {
 			gs.GameOver = true
@@ -336,6 +347,57 @@ func (gs *GameState) handlePlayerMove(playerID string, direction string) {
 	}
 }
 
+// writer é uma goroutine que envia mensagens do `sendChan` para o WebSocket do jogador
+func writer(player *Player) {
+	defer func() {
+		player.conn.Close()
+		// log.Printf("Escritor para o jogador %s encerrado.", player.ID) // Log pode ser verboso
+	}()
+
+	for message := range player.sendChan {
+		if err := player.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			// log.Printf("Erro ao escrever para jogador %s: %v", player.ID, err) // Log pode ser verboso
+			return
+		}
+	}
+}
+
+// reader é uma goroutine que lê mensagens do WebSocket do jogador
+func reader(player *Player) {
+	defer func() {
+		log.Printf("Leitor para o jogador %s encerrando. Realizando limpeza.", player.ID)
+		game.removePlayer(player.ID)
+	}()
+
+	player.conn.SetReadLimit(512)
+	for {
+		messageType, p, err := player.conn.ReadMessage()
+		if err != nil {
+			// if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			// 	log.Printf("Erro de conexão inesperado para jogador %s: %v", player.ID, err)
+			// } else {
+			// 	log.Printf("Jogador %s desconectado: %v", player.ID, err)
+			// } // Logs podem ser verbosos
+			break
+		}
+
+		if messageType == websocket.TextMessage {
+			var msg ClientMessage
+			if err := json.Unmarshal(p, &msg); err != nil {
+				log.Printf("Erro ao deserializar mensagem de %s: %v", player.ID, err)
+				continue
+			}
+
+			if msg.Action == "move" {
+				game.handlePlayerMove(player.ID, msg.Direction)
+			} else if msg.Action == "reset_game_request" && game.GameOver {
+				log.Printf("Jogador %s solicitou reset do jogo.", player.ID)
+				game.initializeItems() // Isso preparará os deltas para o reset
+			}
+		}
+	}
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -344,7 +406,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	playerID := uuid.NewString()
-	// addPlayer já está protegido por mutex e prepara o delta para outros jogadores
+	// addPlayer agora é protegido por mutex e prepara o delta para outros jogadores
 	player := game.addPlayer(playerID, conn)
 
 	go writer(player)
@@ -358,26 +420,27 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Canal de boas-vindas cheio para %s", player.ID)
 	}
 
-	// Enviar estado completo para o NOVO jogador
-	game.mu.Lock()                          // Lock para leitura consistente do estado
-	fullStatePayload := GameStateForClient{ // Usar o DTO
-		Players:     make(map[string]*Player), // Copiar jogadores para evitar problemas com json:"-" nos originais
-		Items:       game.Items,
+	game.mu.Lock()
+	fullStatePayload := GameStateForClient{
+		Players:     make(map[string]*Player),
+		Items:       make(map[string]*Item), // Copia o mapa de itens
 		BoardWidth:  game.BoardWidth,
 		BoardHeight: game.BoardHeight,
 		GameOver:    game.GameOver,
 		WinnerID:    game.WinnerID,
 	}
-	// Copia manual dos players para o DTO (apenas os campos serializáveis)
-	for id, p := range game.Players {
-		if p.IsActive { // Só envia jogadores ativos no estado completo inicial
-			playerCopy := *p // Copia para não enviar ponteiros para `conn` ou `sendChan`
+	for id, p := range game.Players { // Copia jogadores ativos para o DTO
+		if p.IsActive {
+			playerCopy := *p
 			playerCopy.conn = nil
 			playerCopy.sendChan = nil
 			fullStatePayload.Players[id] = &playerCopy
 		}
 	}
-
+	for key, item := range game.Items { // Copia itens
+		itemCopy := *item
+		fullStatePayload.Items[key] = &itemCopy
+	}
 	game.mu.Unlock()
 
 	fullStateMsg := ServerMessage{Type: MsgTypeFullState, Payload: fullStatePayload}
@@ -415,10 +478,8 @@ func broadcastUpdates() {
 		return
 	}
 
-	// Re-adquirir lock para iterar sobre a lista de jogadores de forma segura
-	// Ou, melhor ainda, obter uma lista de canais de envio sob o lock
 	var activePlayerChans []chan []byte
-	game.mu.Lock()
+	game.mu.Lock() // Lock para pegar a lista de canais de jogadores ativos
 	for _, p := range game.Players {
 		if p.IsActive {
 			activePlayerChans = append(activePlayerChans, p.sendChan)
@@ -426,17 +487,17 @@ func broadcastUpdates() {
 	}
 	game.mu.Unlock()
 
-	if len(deltasToSend.PlayersUpdated) > 0 || len(deltasToSend.PlayersRemoved) > 0 || len(deltasToSend.ItemsAdded) > 0 || len(deltasToSend.ItemsRemoved) > 0 || deltasToSend.GameStatus != nil {
-		//log.Printf("Enviando deltas: %+v", deltasToSend) // Log pode ser verboso
-	}
+	// Log dos deltas apenas se houver algo significativo (para não poluir com deltas vazios se a lógica permitir)
+	// if len(deltasToSend.PlayersUpdated) > 0 || len(deltasToSend.PlayersRemoved) > 0 || len(deltasToSend.ItemsAdded) > 0 || len(deltasToSend.ItemsRemoved) > 0 || deltasToSend.GameStatus != nil {
+	// 	log.Printf("Enviando deltas: PlayersUpdated: %d, PlayersRemoved: %d, ItemsAdded: %d, ItemsRemoved: %d, GameStatus: %v",
+	// 		len(deltasToSend.PlayersUpdated), len(deltasToSend.PlayersRemoved), len(deltasToSend.ItemsAdded), len(deltasToSend.ItemsRemoved), deltasToSend.GameStatus != nil)
+	// }
 
 	for _, ch := range activePlayerChans {
 		select {
 		case ch <- messageData:
 		default:
-			// Não podemos identificar o jogador aqui facilmente sem o objeto Player
-			// Se o log for crucial, a iteração original sobre game.Players (com lock) é melhor
-			log.Println("Um canal de jogador estava cheio ao enviar deltas.")
+			// log.Println("Um canal de jogador estava cheio ao enviar deltas.") // Log pode ser verboso
 		}
 	}
 }
@@ -460,7 +521,6 @@ func gameLoop() {
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	// game.initializeItems() // Movido para dentro do gameLoop para garantir que maps estejam inicializados
 
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -468,10 +528,6 @@ func main() {
 			http.NotFound(w, r)
 			return
 		}
-		// A string HTML permanece a mesma da sua última versão com UI/UX melhorado
-		// Lembre-se que o JavaScript do cliente precisará ser ATUALIZADO
-		// para lidar com os novos tipos de mensagem: "welcome", "full_state", "delta_update"
-		// e para manter um 'localGameState'.
 		html := `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -481,16 +537,16 @@ func main() {
     <title>Go Diamond Collector</title>
     <style>
         :root {
-            --primary-bg: #f4f7f6;
-            --secondary-bg: #ffffff;
-            --accent-color: #3498db; /* Azul suave */
-            --accent-hover: #2980b9;
-            --text-color: #333333;
-            --border-color: #dddddd;
+            --primary-bg: #f4f7f6; /* Fundo principal da página */
+            --secondary-bg: #ffffff; /* Fundo de containers como info, board-wrapper */
+            --accent-color: #3498db; /* Azul suave para títulos, botões */
+            --accent-hover: #2980b9; /* Hover do accent-color */
+            --text-color: #333333; /* Cor principal do texto */
+            --border-color: #dddddd; /* Cor para bordas sutis */
             --item-bg: #f1c40f; /* Dourado para itens */
-            --player-bg: #87ceeb; /* Azul céu para jogador */
-            --self-player-bg: #5dade2; /* Azul mais forte para jogador local */
-            --shadow-color: rgba(0,0,0,0.1);
+            --player-bg: #87ceeb; /* Azul céu para outros jogadores */
+            --self-player-bg: #5dade2; /* Azul mais forte para o jogador local */
+            --shadow-color: rgba(0,0,0,0.08); /* Sombra mais suave */
         }
         body { 
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
@@ -507,36 +563,42 @@ func main() {
             margin-bottom: 0.5em;
             font-size: 2.2em; 
             color: var(--accent-color);
-            font-weight: 300;
+            font-weight: 300; /* Fonte mais leve para o título */
+            text-align: center;
         }
         #game-description {
             background-color: var(--secondary-bg);
-            padding: 15px 20px;
+            padding: 20px 25px; /* Mais padding */
             border-radius: 8px;
-            margin-bottom: 25px;
+            margin-bottom: 30px; /* Mais espaço */
             max-width: 700px;
-            box-shadow: 0 2px 4px var(--shadow-color);
+            width: 90%;
+            box-shadow: 0 4px 8px var(--shadow-color); /* Sombra mais pronunciada */
             text-align: left;
         }
         #game-description h2 {
             margin-top: 0;
             color: var(--accent-color);
             font-size: 1.4em;
-            font-weight: 400;
+            font-weight: 500; /* Peso médio */
             border-bottom: 1px solid var(--border-color);
             padding-bottom: 0.5em;
-            margin-bottom: 0.8em;
+            margin-bottom: 1em; /* Mais espaço */
         }
         #game-description p, #game-description ul {
             font-size: 0.95em;
-            margin-bottom: 0.8em;
+            margin-bottom: 1em;
         }
         #game-description ul {
-            list-style-type: disc;
-            padding-left: 20px;
+            list-style-position: inside; /* Bolinhas dentro do padding */
+            padding-left: 0; /* Remove padding padrão do ul */
+        }
+         #game-description li {
+            margin-bottom: 0.5em;
         }
         #game-description strong {
-            color: var(--accent-color);
+            font-weight: 600; /* Destaca um pouco mais */
+            /* color: var(--accent-color); // Mantém a cor do texto para não sobrecarregar */
         }
         #game-container { 
             display: flex; 
@@ -544,6 +606,7 @@ func main() {
             gap: 25px; 
             justify-content: center;
             width: 100%;
+            align-items: flex-start; /* Alinha os itens no topo */
         }
         #board-wrapper { 
             width: auto; 
@@ -551,10 +614,10 @@ func main() {
             overflow-x: auto; 
             display: flex;
             justify-content: center; 
-            padding: 5px; 
+            padding: 10px; /* Padding interno */
             background-color: var(--secondary-bg);
             border-radius: 8px;
-            box-shadow: 0 2px 4px var(--shadow-color);
+            box-shadow: 0 4px 8px var(--shadow-color);
         }
         #board {
             border-collapse: collapse;
@@ -578,9 +641,9 @@ func main() {
         .item { background-color: var(--item-bg); color: white; border-radius: 3px; animation: pulseItem 1.5s infinite ease-in-out; }
         .self { font-weight: bold; background-color: var(--self-player-bg); box-shadow: 0 0 5px 3px var(--accent-hover); } 
         @keyframes pulseItem {
-            0% { transform: scale(0.9); }
-            50% { transform: scale(1.05); }
-            100% { transform: scale(0.9); }
+            0% { transform: scale(0.9); opacity: 0.8; }
+            50% { transform: scale(1.05); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.8; }
         }
         #info { 
             text-align: left; 
@@ -589,14 +652,16 @@ func main() {
             background-color: var(--secondary-bg); 
             border-radius: 8px; 
             min-width: 280px; 
-            box-shadow: 0 2px 4px var(--shadow-color);
+            width: auto; /* Para não forçar largura em flex */
+            max-width: 350px; /* Limita a largura máxima */
+            box-shadow: 0 4px 8px var(--shadow-color);
         }
         #info h3 { 
             margin-top: 0; 
             margin-bottom: 10px; 
             font-size: 1.3em;
             color: var(--accent-color);
-            font-weight: 400;
+            font-weight: 500;
         }
         #info pre { 
             margin-top: 5px; 
@@ -643,9 +708,9 @@ func main() {
         }
         #game-over-msg { 
             padding: 15px;
-            background-color: #ffdddd;
-            border: 1px solid #ffaaaa;
-            color: #d8000c; 
+            background-color: #ffebee; /* Vermelho claro para game over */
+            border: 1px solid #ffcdd2;
+            color: #c62828; /* Vermelho escuro */
             font-weight:bold; 
             margin-bottom: 15px; 
             font-size: 1.2em; 
@@ -660,10 +725,11 @@ func main() {
             background-color: #31b0d5;
         }
 
+        /* === Media Queries para Responsividade === */
         @media (max-width: 768px) {
             body { padding: 15px; }
             h1 { font-size: 1.8em; }
-            #game-description { width: 95%; padding: 15px; margin-bottom: 20px;}
+            #game-description { width: 90%; padding: 15px; margin-bottom: 20px;}
             #game-description h2 { font-size: 1.3em; }
             #game-description p, #game-description ul { font-size: 0.9em; }
 
@@ -681,7 +747,7 @@ func main() {
             }
             #info {
                 width: 90%; 
-                max-width: 480px; 
+                max-width: 100%; /* Permite que o info ocupe mais espaço se necessário */
                 min-width: unset;
                 padding: 15px;
             }
@@ -795,11 +861,10 @@ func main() {
         const ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
         let myPlayerId = null;
 
-        // Variável para manter o estado local do jogo no cliente
         let localGameState = {
             players: {},
             items: {},
-            boardWidth: ${BoardWidth}, // Inicializa com constantes do Go
+            boardWidth: ${BoardWidth}, 
             boardHeight: ${BoardHeight},
             gameOver: false,
             winnerId: null
@@ -817,7 +882,7 @@ func main() {
             logElement.textContent = timeString + ": " + message + "\n" + logElement.textContent;
         }
 
-        function drawBoard(gameStateToDraw) { // Agora usa o estado passado como argumento
+        function drawBoard(gameStateToDraw) { 
             boardElement.innerHTML = ''; 
             for (let y = 0; y < gameStateToDraw.boardHeight; y++) {
                 const row = boardElement.insertRow();
@@ -839,13 +904,18 @@ func main() {
             let scoresHTML = "";
             for (const id in gameStateToDraw.players) {
                 const player = gameStateToDraw.players[id];
-                const cell = document.getElementById('cell-' + player.pos.x + '-' + player.pos.y);
-                if (cell) {
-                    cell.classList.add('player');
-                    cell.textContent = player.id.substring(0,2); 
-                    if (player.id === myPlayerId) {
-                        cell.classList.add('self');
+                // Adicionado try-catch para o caso de player.pos não estar definido ainda
+                try {
+                    const cell = document.getElementById('cell-' + player.pos.x + '-' + player.pos.y);
+                    if (cell) {
+                        cell.classList.add('player');
+                        cell.textContent = player.id.substring(0,2); 
+                        if (player.id === myPlayerId) {
+                            cell.classList.add('self');
+                        }
                     }
+                } catch (e) {
+                    clientLog("Erro ao desenhar jogador " + player.id + ": " + e.message);
                 }
                 scoresHTML += player.id.substring(0,8) + "...: " + player.score + "\n";
             }
@@ -872,7 +942,6 @@ func main() {
                 myPlayerId = serverMsg.payload.playerId;
                 myIdElement.textContent = myPlayerId.substring(0,8) + "..."; 
                 clientLog("Bem-vindo! Seu ID: " + myPlayerId + ". Aguardando estado completo do jogo...");
-                // Não desenha o tabuleiro ainda, espera pelo full_state
             } else if (serverMsg.type === "full_state") {
                 clientLog("Recebido Estado Completo do Jogo.");
                 localGameState.players = serverMsg.payload.players || {};
@@ -883,15 +952,14 @@ func main() {
                 localGameState.winnerId = serverMsg.payload.winnerId;
                 drawBoard(localGameState); 
             } else if (serverMsg.type === "delta_update") {
-                // clientLog("Recebido Delta Update: " + JSON.stringify(serverMsg.payload));
                 const delta = serverMsg.payload;
 
                 if (delta.playersUpdated) {
                     for (const playerId in delta.playersUpdated) {
                         const pDelta = delta.playersUpdated[playerId];
                         if (!localGameState.players[playerId]) { 
-                            localGameState.players[playerId] = { id: playerId, score: 0, pos: {x:0, y:0} }; // Inicializa se não existe
-                            clientLog("Novo jogador via delta: " + playerId);
+                            localGameState.players[playerId] = { id: playerId, score: 0, pos: pDelta.pos || {x:0, y:0} }; 
+                            // clientLog("Novo jogador via delta: " + playerId);
                         }
                         if (pDelta.pos) {
                             localGameState.players[playerId].pos = pDelta.pos;
@@ -905,17 +973,15 @@ func main() {
                 if (delta.playersRemoved) {
                     delta.playersRemoved.forEach(playerId => {
                         delete localGameState.players[playerId];
-                        clientLog("Jogador removido via delta: " + playerId);
+                        // clientLog("Jogador removido via delta: " + playerId);
                     });
                 }
                 
-                // Para ItemsAdded, especialmente no reset, é melhor substituir todos os itens.
-                // Se fosse adição incremental de itens durante o jogo, seria diferente.
-                if (delta.itemsAdded && delta.itemsAdded.length > 0) {
-                    clientLog("Itens adicionados/resetados via delta. Total: " + delta.itemsAdded.length);
-                    localGameState.items = {}; // Limpa itens existentes antes de adicionar os novos
+                if (delta.itemsAdded && delta.itemsAdded.length >= 0) { // Checa se existe e se tem itens (pode ser array vazio no reset)
+                    // clientLog("Itens adicionados/resetados via delta. Total: " + delta.itemsAdded.length);
+                    localGameState.items = {}; 
                     delta.itemsAdded.forEach(item => {
-                        const itemKey = item.pos.x + "," + item.pos.y; // Usa a posição como chave, como no servidor
+                        const itemKey = item.pos.x + "," + item.pos.y; 
                         localGameState.items[itemKey] = item;
                     });
                 }
