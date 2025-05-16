@@ -1,5 +1,5 @@
 # Estágio 1: Build
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 WORKDIR /app
 # Copiar go.mod e go.sum primeiro para aproveitar o cache do Docker
 COPY go.mod go.sum ./
